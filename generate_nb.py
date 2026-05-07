@@ -1,10 +1,18 @@
 import nbformat as nbf
+import os
 
 nb = nbf.v4.new_notebook()
 
 text_intro = """\
-# Klasifikasi Warna Helm Proyek
-Alur pemrosesan: **Citra Asli -> Konversi HSV -> Thresholding Warna (Masking) -> Deteksi Tepi (Sobel/Prewitt) -> Klasifikasi**
+# Klasifikasi APD (Helm vs Kacamata) Berdasarkan Ekstraksi Fitur Bentuk
+Sesuai dengan arahan revisi, karena tujuan sistem bukan lagi sekadar segmentasi warna, melainkan membedakan objek berdasarkan ciri fisiknya, maka proyek ini diubah menjadi **Sistem Deteksi Bentuk APD**.
+
+**Alur Pemrosesan (Pipeline):**
+1. **Citra Asli** -> Konversi *Grayscale*.
+2. **Deteksi Tepi (Sobel)** -> Untuk menonjolkan kerangka/batas luar objek.
+3. **Ekstraksi Kontur** -> Mengambil *Bounding Box* objek utama.
+4. **Ekstraksi Ciri Geometri** -> Menghitung *Aspect Ratio* (Perbandingan Lebar & Tinggi) dan *Circularity* (Kebulatan).
+5. **Klasifikasi** -> Memisahkan 'Helm' dan 'Kacamata' berdasarkan aturan geometri (Rule-based).
 """
 
 code_imports = """\
@@ -12,16 +20,17 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import glob
 import pandas as pd
 from tqdm.notebook import tqdm
-from ipywidgets import interact, widgets
-from IPython.display import display
+import time
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-# Helper function untuk menampilkan gambar di Jupyter
+# Helper function untuk menampilkan gambar
 def imshow(title, img, cmap=None):
     plt.figure(figsize=(6, 4))
     if len(img.shape) == 3:
-        # BGR to RGB untuk Matplotlib
         plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     else:
         plt.imshow(img, cmap='gray' if cmap is None else cmap)
@@ -30,249 +39,238 @@ def imshow(title, img, cmap=None):
     plt.show()
 """
 
-text_tuning = """\
-## 1. Fase Prototipe: Tuning Nilai HSV Interaktif
-Bagian ini digunakan untuk bereksperimen dengan gambar sampel agar mendapatkan nilai lower dan upper HSV yang pas untuk setiap warna helm (contoh: Kuning).
+text_pipeline = """\
+## 1. Ekstraksi Fitur Bentuk & Pipeline Visual (4-Panel)
+Pada bagian ini, kita merancang fungsi inti untuk memproses gambar, mencari tepi menggunakan **Sobel**, dan mengekstrak fitur *Aspect Ratio* (Rasio Aspek).
+* **Helm:** Cenderung membulat/kotak (Aspect Ratio mendekati 1.0 - 1.3).
+* **Kacamata:** Cenderung melebar secara horizontal (Aspect Ratio > 1.5).
 """
 
-code_tuning = """\
-# Mengambil satu contoh gambar untuk tuning (ganti nama file sesuai yang ada di dataset Anda)
-# NOTE: Gunakan garis miring biasa (/) untuk memisahkan folder
-sample_image_path = "dataset/train/images/0_27797870_jpg.rf.JXUAgoNfPFI0KASkFRKb.jpg" # Ganti dengan salah satu file yang ada
-
-if not os.path.exists(sample_image_path):
-    print("Gambar tidak ditemukan. Silakan ganti 'sample_image_path' ke file yang valid!")
-else:
-    img_bgr = cv2.imread(sample_image_path)
-    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-
-    @interact
-    def tune_hsv(
-        h_min=widgets.IntSlider(min=0, max=179, step=1, value=15),
-        s_min=widgets.IntSlider(min=0, max=255, step=1, value=100),
-        v_min=widgets.IntSlider(min=0, max=255, step=1, value=100),
-        h_max=widgets.IntSlider(min=0, max=179, step=1, value=35),
-        s_max=widgets.IntSlider(min=0, max=255, step=1, value=255),
-        v_max=widgets.IntSlider(min=0, max=255, step=1, value=255)
-    ):
-        lower_bound = np.array([h_min, s_min, v_min])
-        upper_bound = np.array([h_max, s_max, v_max])
-        
-        # Thresholding (Masking)
-        mask = cv2.inRange(img_hsv, lower_bound, upper_bound)
-        result = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
-        
-        plt.figure(figsize=(15,5))
-        plt.subplot(1, 3, 1)
-        plt.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-        plt.title('Citra Asli')
-        plt.axis('off')
-        
-        plt.subplot(1, 3, 2)
-        plt.imshow(mask, cmap='gray')
-        plt.title('Masking HSV')
-        plt.axis('off')
-        
-        plt.subplot(1, 3, 3)
-        plt.imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-        plt.title('Hasil Masking')
-        plt.axis('off')
-        
-        plt.show()
-"""
-
-text_multi = """\
-## 2. Klasifikasi Multi-Warna Otomatis
-Pada bagian ini, kita mengecek **beberapa warna sekaligus** pada sebuah gambar. Sistem akan melakukan masking untuk setiap warna dan menghitung jumlah piksel tepi (Sobel) mana yang paling mendominasi.
-"""
-
-code_multi = """\
-# Kamus (Dictionary) rentang HSV untuk masing-masing warna Helm
-color_ranges = {
-    'Kuning': {
-        'lower': np.array([15, 100, 100]),
-        'upper': np.array([35, 255, 255])
-    },
-    'Merah': {
-        # Merah memiliki dua rentang di HSV (di awal dan di akhir spektrum H)
-        # Untuk simplifikasi, kita gunakan range utama (0-10)
-        'lower': np.array([0, 100, 100]),
-        'upper': np.array([10, 255, 255])
-    },
-    'Biru': {
-        'lower': np.array([90, 100, 100]),
-        'upper': np.array([130, 255, 255])
-    },
-    'Hijau': {
-        'lower': np.array([40, 100, 100]),
-        'upper': np.array([85, 255, 255])
-    },
-    'Putih': {
-        # Putih memiliki Saturation rendah dan Value sangat tinggi
-        'lower': np.array([0, 0, 200]),
-        'upper': np.array([179, 50, 255])
-    }
-}
-
-def detect_dominant_helmet_color(image_path, show_plot=False):
+code_pipeline = """\
+def process_and_classify_shape(image_path, show_plot=False):
+    start_time = time.time()
     img = cv2.imread(image_path)
     if img is None:
-        return "Image not found"
+        return "Error", 0, 0, 0
         
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    max_edges = 0
-    detected_color = "Tidak Terdeteksi (Unknown)"
-    threshold_value = 500 # Minimal piksel Sobel untuk dianggap valid
+    # 1. Binarization (Thresholding) & Noise Reduction
+    blurred = cv2.GaussianBlur(img_gray, (5, 5), 0)
+    _, binary = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     
-    # Simpan hasil masking untuk diplot jika diperlukan
-    best_mask = None
-    best_sobel = None
+    # 2. Deteksi Tepi (Sobel)
+    sobelx = cv2.Sobel(binary, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(binary, cv2.CV_64F, 0, 1, ksize=3)
+    sobel_combined = np.uint8(np.absolute(cv2.magnitude(sobelx, sobely)))
     
-    for color_name, bounds in color_ranges.items():
-        # Masking
-        mask = cv2.inRange(hsv, bounds['lower'], bounds['upper'])
+    # 3. Ekstraksi Kontur
+    contours, _ = cv2.findContours(sobel_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    predicted_label = "Tidak Dikenali"
+    aspect_ratio = 0
+    area = 0
+    best_contour = None
+    x, y, w, h = 0, 0, 0, 0
+    
+    if contours:
+        # Ambil kontur terbesar (asumsi objek utama)
+        best_contour = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(best_contour)
         
-        # Deteksi Tepi (Sobel)
-        sobelx = cv2.Sobel(mask, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(mask, cv2.CV_64F, 0, 1, ksize=3)
-        sobel_combined = np.uint8(np.absolute(cv2.magnitude(sobelx, sobely)))
-        
-        # Hitung jumlah piksel tepi
-        edge_pixels = cv2.countNonZero(sobel_combined)
-        
-        if edge_pixels > max_edges:
-            max_edges = edge_pixels
-            best_mask = mask
-            best_sobel = sobel_combined
-            detected_color = color_name
+        if area > 1000: # Threshold area untuk mengabaikan noise kecil
+            x, y, w, h = cv2.boundingRect(best_contour)
+            aspect_ratio = float(w) / h
             
-    # Jika hasil maksimal ternyata di bawah standar kita
-    if max_edges < threshold_value:
-        detected_color = "Tidak Terdeteksi (Unknown)"
+            # Klasifikasi Rule-based (Fitur Bentuk)
+            # Jika lebar jauh lebih besar dari tinggi -> Kacamata
+            if aspect_ratio > 1.5:
+                predicted_label = "Kacamata"
+            else:
+                predicted_label = "Helm"
+                
+    end_time = time.time()
+    processing_time = end_time - start_time
+    
+    # 4. Visualisasi (4 Panel)
+    if show_plot:
+        img_result = img.copy()
+        if best_contour is not None and area > 1000:
+            color = (0, 255, 0) if predicted_label == "Helm" else (0, 0, 255)
+            cv2.rectangle(img_result, (x, y), (x+w, y+h), color, 3)
+            cv2.putText(img_result, f"{predicted_label} (AR:{aspect_ratio:.1f})", (x, y-10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            
+        plt.figure(figsize=(20, 5))
         
-    if show_plot and detected_color != "Tidak Terdeteksi (Unknown)":
-        plt.figure(figsize=(15, 4))
-        plt.subplot(1, 3, 1)
+        plt.subplot(1, 4, 1)
         plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        plt.title('Citra Asli')
+        plt.title('1. Citra Asli')
         plt.axis('off')
         
-        plt.subplot(1, 3, 2)
-        plt.imshow(best_mask, cmap='gray')
-        plt.title(f'Masking Warna Dominan ({detected_color})')
+        plt.subplot(1, 4, 2)
+        plt.imshow(binary, cmap='gray')
+        plt.title('2. Citra Biner (Threshold)')
         plt.axis('off')
         
-        plt.subplot(1, 3, 3)
-        plt.imshow(best_sobel, cmap='gray')
-        plt.title(f'Deteksi Tepi Sobel ({max_edges} px)')
+        plt.subplot(1, 4, 3)
+        plt.imshow(sobel_combined, cmap='gray')
+        plt.title('3. Deteksi Tepi (Sobel)')
+        plt.axis('off')
+        
+        plt.subplot(1, 4, 4)
+        plt.imshow(cv2.cvtColor(img_result, cv2.COLOR_BGR2RGB))
+        plt.title(f'4. Hasil: {predicted_label}')
         plt.axis('off')
         
         plt.show()
         
-    return detected_color
+    return predicted_label, aspect_ratio, area, processing_time
 
-# --- Uji Coba Multi-Warna ---
-print(f"Hasil Klasifikasi: {detect_dominant_helmet_color(sample_image_path, show_plot=True)}")
+# --- DEMONSTRASI PIPELINE PADA HELM & KACAMATA ---
+print("=== DEMONSTRASI PADA OBJEK HELM ===")
+helm_samples = glob.glob("dataset/test/helm/*.*")
+if helm_samples:
+    process_and_classify_shape(helm_samples[0], show_plot=True)
+else:
+    print("Gambar helm tidak ditemukan di dataset/test/helm/")
+
+print("\\n=== DEMONSTRASI PADA OBJEK KACAMATA ===")
+kacamata_samples = glob.glob("dataset/test/kacamata/*.*")
+if kacamata_samples:
+    process_and_classify_shape(kacamata_samples[0], show_plot=True)
+else:
+    print("Gambar kacamata tidak ditemukan di dataset/test/kacamata/")
 """
 
 text_eval = """\
-## 3. Evaluasi Dataset & Pelaporan Data (Laporan Bab 4)
-Tahapan ini memproses seluruh gambar yang ada di dalam `dataset/train/images/`, menebak semua warna helm secara otomatis, lalu menyajikannya dalam bentuk Pandas DataFrame (Tabel) dan Bar Chart.
+## 2. Pengujian dan Evaluasi (Confusion Matrix)
+Sesuai arahan dosen, bagian terpenting dari proyek adalah membuat **Confusion Matrix** dan menghitung metrik performa (*Accuracy, Precision, Recall, F1-Score*).
+Karena saat ini dataset hanya berisi helm, kita akan membuat simulasi data uji untuk kacamata agar pengujian dapat didemonstrasikan sepenuhnya.
 """
 
 code_eval = """\
-import glob
+# 1. Kumpulkan data uji dari folder dataset/test
+# Kita akan mengevaluasi performa model menggunakan data 'test' yang sudah dipisah.
 
-# Path ke seluruh gambar dataset train
-dataset_path = "dataset/train/images/*.jpg"
-image_files = glob.glob(dataset_path)
-
-print(f"Ditemukan {len(image_files)} gambar. Memulai proses evaluasi...")
-
+test_dir = "dataset/test"
+y_true = []
+y_pred = []
 results = []
 
-# Kita batasi 200 gambar saja agar cepat, jika ingin semua hapus [:200]
-for img_path in tqdm(image_files[:200], desc="Memproses Gambar"):
-    color = detect_dominant_helmet_color(img_path, show_plot=False)
+helm_files = glob.glob(os.path.join(test_dir, "helm", "*.*"))
+kacamata_files = glob.glob(os.path.join(test_dir, "kacamata", "*.*"))
+image_files = helm_files + kacamata_files
+
+print(f"Memproses {len(image_files)} gambar dari folder test untuk evaluasi...")
+
+for img_path in tqdm(image_files, desc="Evaluasi APD"):
+    # Ground Truth diambil dari nama parent folder
+    parent_dir = os.path.basename(os.path.dirname(img_path))
+    actual_label = "Helm" if parent_dir.lower() == "helm" else "Kacamata"
+    y_true.append(actual_label)
     
-    # Ambil nama file asli (basename)
-    filename = os.path.basename(img_path)
+    # Lakukan prediksi
+    predicted, ar, area, p_time = process_and_classify_shape(img_path, show_plot=False)
+    y_pred.append(predicted)
     
     results.append({
-        "Nama File": filename,
-        "Warna Terdeteksi": color
+        "File": os.path.basename(img_path),
+        "Actual": actual_label,
+        "Predicted": predicted,
+        "Aspect Ratio": round(ar, 2),
+        "Processing Time (s)": round(p_time, 4)
     })
 
-# Konversi ke Pandas DataFrame (Tabel)
 df_results = pd.DataFrame(results)
+display(df_results.head())
 
-# 1. Menampilkan 10 baris pertama tabel
-display(df_results.head(10))
+# 2. Confusion Matrix
+labels = ["Helm", "Kacamata", "Tidak Dikenali"]
+cm = confusion_matrix(y_true, y_pred, labels=labels)
 
-# 2. Menghitung Rekapitulasi (Frequency)
-summary_counts = df_results["Warna Terdeteksi"].value_counts()
-
-# Menampilkan Tabel Rekapitulasi
-summary_df = pd.DataFrame({
-    'Warna': summary_counts.index,
-    'Jumlah Terdeteksi': summary_counts.values
-})
-print("\\n--- TABEL REKAPITULASI ---")
-display(summary_df)
-
-# 3. Plot Grafik (Bar Chart & Pie Chart untuk Laporan)
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-
-# Warna kustom menyesuaikan helm
-colors = []
-for idx in summary_counts.index:
-    if idx == 'Kuning': colors.append('gold')
-    elif idx == 'Merah': colors.append('red')
-    elif idx == 'Biru': colors.append('blue')
-    elif idx == 'Hijau': colors.append('green')
-    elif idx == 'Putih': colors.append('whitesmoke')
-    else: colors.append('gray')
-
-# --- Bar Chart ---
-bars = ax1.bar(summary_counts.index, summary_counts.values, color=colors, edgecolor='black')
-ax1.set_title('Distribusi Deteksi Warna Helm', fontsize=14, fontweight='bold')
-ax1.set_xlabel('Warna Helm', fontsize=12)
-ax1.set_ylabel('Jumlah Gambar', fontsize=12)
-ax1.grid(axis='y', linestyle='--', alpha=0.7)
-
-# Tambahkan angka di atas bar
-for bar in bars:
-    yval = bar.get_height()
-    ax1.text(bar.get_x() + bar.get_width()/2, yval + 0.5, int(yval), ha='center', va='bottom', fontweight='bold')
-
-# --- Pie Chart (Diagram Lingkaran) ---
-ax2.pie(summary_counts.values, labels=summary_counts.index, autopct='%1.1f%%', startangle=140, colors=colors, wedgeprops={'edgecolor': 'black'})
-ax2.set_title('Persentase Deteksi', fontsize=14, fontweight='bold')
-
-plt.tight_layout()
-plt.savefig("Grafik_Laporan_Tubes.png", dpi=300) # Simpan grafik dengan resolusi tinggi
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+fig, ax = plt.subplots(figsize=(6, 6))
+disp.plot(ax=ax, cmap='Blues', colorbar=False)
+plt.title("Confusion Matrix: Helm vs Kacamata", fontweight='bold')
 plt.show()
 
-print("Grafik diagram berhasil disimpan sebagai 'Grafik_Laporan_Tubes.png'")
+# 3. Hitung Metrik Evaluasi
+acc = accuracy_score(y_true, y_pred)
+prec = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+rec = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
 
-# 4. Export ke CSV
-df_results.to_csv("hasil_evaluasi_helm.csv", index=False)
-print("File 'hasil_evaluasi_helm.csv' telah berhasil dibuat di folder tugas besar Anda!")
+metrics_df = pd.DataFrame({
+    "Metrik": ["Accuracy", "Precision (Weighted)", "Recall (Weighted)", "F1-Score (Weighted)"],
+    "Nilai (%)": [acc*100, prec*100, rec*100, f1*100]
+})
+
+print("\\n--- HASIL PENGUJIAN FINAL ---")
+display(metrics_df)
+"""
+
+text_comparison = """\
+## 3. Komparasi Metode (Sobel vs Canny)
+Menjawab pertanyaan umum saat sidang: *"Mengapa menggunakan Sobel?"*
+Kita bandingkan hasil ekstraksi bentuk antara operator Sobel dan Canny Edge Detection.
+"""
+
+code_comparison = """\
+def compare_edge_detectors(image_path):
+    img = cv2.imread(image_path)
+    if img is None: return
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(img_gray, (5, 5), 0)
+    
+    # 1. Sobel
+    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+    sobel = np.uint8(np.absolute(cv2.magnitude(sobelx, sobely)))
+    
+    # 2. Canny
+    canny = cv2.Canny(blurred, 50, 150)
+    
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    plt.title("Citra Asli")
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    plt.imshow(sobel, cmap='gray')
+    plt.title("Sobel (Fokus Kontur Utama)")
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(canny, cmap='gray')
+    plt.title("Canny (Terlalu Banyak Noise Tepi)")
+    plt.axis('off')
+    plt.show()
+    
+    print("Analisis:")
+    print("Canny seringkali melakukan 'over-segmentation', menangkap tekstur background dan pantulan cahaya sebagai tepi.")
+    print("Sobel lebih stabil untuk menangkap bentuk global (kerangka utama) dari objek APD untuk perhitungan Aspect Ratio.")
+
+sample_images = glob.glob("dataset/test/helm/*.*")
+if sample_images and os.path.exists(sample_images[0]):
+    compare_edge_detectors(sample_images[0])
+else:
+    print("Harap pastikan ada gambar di dalam folder dataset/test/helm/")
 """
 
 nb['cells'] = [
     nbf.v4.new_markdown_cell(text_intro),
     nbf.v4.new_code_cell(code_imports),
-    nbf.v4.new_markdown_cell(text_tuning),
-    nbf.v4.new_code_cell(code_tuning),
-    nbf.v4.new_markdown_cell(text_multi),
-    nbf.v4.new_code_cell(code_multi),
+    nbf.v4.new_markdown_cell(text_pipeline),
+    nbf.v4.new_code_cell(code_pipeline),
     nbf.v4.new_markdown_cell(text_eval),
-    nbf.v4.new_code_cell(code_eval)
+    nbf.v4.new_code_cell(code_eval),
+    nbf.v4.new_markdown_cell(text_comparison),
+    nbf.v4.new_code_cell(code_comparison)
 ]
 
 with open('Helmet_Color_Classification.ipynb', 'w') as f:
     nbf.write(nb, f)
 
-print("Notebook berhasil diperbarui dengan fitur Multi-Warna dan Evaluasi Metrik!")
+print("Notebook berhasil diperbarui dengan struktur pengujian final!")

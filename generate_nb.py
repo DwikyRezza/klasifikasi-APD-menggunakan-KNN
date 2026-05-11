@@ -33,7 +33,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import (confusion_matrix, ConfusionMatrixDisplay,
                              accuracy_score, precision_score,
                              recall_score, f1_score, classification_report)
-from sklearn.model_selection import train_test_split, learning_curve, StratifiedKFold
+from sklearn.model_selection import train_test_split, learning_curve, StratifiedKFold, GridSearchCV, cross_val_score
 from IPython.display import display
 
 print(" Semua library berhasil diimport.")
@@ -195,49 +195,83 @@ print(" Fitur yang baik akan menunjukkan pemisahan yang jelas antara Helm dan Ka
 """
 
 text_train = """\
-## Tahap 2a: Pelatihan Model Random Forest
+## Tahap 2a: Pelatihan Model Random Forest (Optimasi Lanjutan)
 
-Data fitur tadi akan kita "ajarkan" ke model Machine Learning.
-Kita menggunakan **Random Forest Classifier** dengan `class_weight='balanced'` untuk menangani kemungkinan data tidak seimbang.
-Selain akurasi, kita akan membuat grafik **Learning Curve** untuk melihat proses belajarnya.
+Data fitur tadi akan kita bersihkan dari outlier, lalu di-"ajarkan" ke model Machine Learning.
+Langkah tingkat lanjut yang dilakukan:
+1. **Outlier Removal (IQR)**: Membuang anomali pada fitur geometri.
+2. **Hyperparameter Tuning (GridSearchCV)**: Mencari kombinasi parameter terbaik untuk Random Forest.
+3. **5-Fold Cross Validation**: Menguji keandalan model secara silang.
+4. **Feature Importance**: Menganalisis fitur mana yang paling penting.
 """
 
 code_training = """\
 # PENTING: Shuffle dulu agar Helm & Kacamata tercampur rata
 df_train_shuffled = df_train.sample(frac=1, random_state=42).reset_index(drop=True)
-print(f"Data setelah di-shuffle: {df_train_shuffled.groupby('label').size().to_dict()}")
 
-X = df_train_shuffled[["aspect_ratio", "circularity", "solidity", "extent", "hull_ar"]].values
-y = df_train_shuffled["label_id"].values
-label_names = ["Helm", "Kacamata"]
+# 1. CLEANING OUTLIER DENGAN IQR (Interquartile Range)
+# Membuang outlier ekstrim untuk membersihkan data dari kesalahan ekstraksi background
+Q1 = df_train_shuffled[['aspect_ratio', 'circularity', 'solidity']].quantile(0.05)
+Q3 = df_train_shuffled[['aspect_ratio', 'circularity', 'solidity']].quantile(0.95)
+IQR = Q3 - Q1
+df_clean = df_train_shuffled[~((df_train_shuffled[['aspect_ratio', 'circularity', 'solidity']] < (Q1 - 1.5 * IQR)) | (df_train_shuffled[['aspect_ratio', 'circularity', 'solidity']] > (Q3 + 1.5 * IQR))).any(axis=1)]
+
+print(f"Data awal: {len(df_train_shuffled)}, Setelah hapus outlier ekstrim: {len(df_clean)}")
+print(f"Distribusi Kelas: {df_clean.groupby('label').size().to_dict()}")
+
+X = df_clean[["aspect_ratio", "circularity", "solidity", "extent", "hull_ar"]].values
+y = df_clean["label_id"].values
+feature_names = ["Aspect Ratio", "Circularity", "Solidity", "Extent", "Hull AR"]
 
 # Split untuk validasi internal (80/20 dari data train)
 X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-# Pipeline: Random Forest dengan class_weight='balanced'
-rf_pipeline = Pipeline([
+# 2. HYPERPARAMETER TUNING DENGAN GRIDSEARCHCV
+pipeline_template = Pipeline([
     ("scaler", StandardScaler()),
-    ("rf", RandomForestClassifier(
-        n_estimators=200,
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=-1
-    ))
+    ("rf", RandomForestClassifier(class_weight="balanced", random_state=42))
 ])
 
-print(" Melatih model Random Forest (Balanced)...")
-rf_pipeline.fit(X_tr, y_tr)
+param_grid = {
+    'rf__n_estimators': [100, 200],
+    'rf__max_depth': [None, 10, 20],
+    'rf__min_samples_split': [2, 5]
+}
+
+print("\\n Mencari hyperparameter terbaik (GridSearchCV)...")
+grid_search = GridSearchCV(pipeline_template, param_grid, cv=3, scoring='accuracy', n_jobs=-1)
+grid_search.fit(X_tr, y_tr)
+
+rf_pipeline = grid_search.best_estimator_
+print(f" Parameter terbaik: {grid_search.best_params_}")
 
 val_acc = rf_pipeline.score(X_val, y_val)
-print(f" Training selesai!")
-print(f"   Akurasi pada data validasi internal: {val_acc*100:.2f}%")
+print(f" Akurasi pada data validasi internal (20%): {val_acc*100:.2f}%")
+
+# 3. K-FOLD CROSS VALIDATION
+cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_scores = cross_val_score(rf_pipeline, X, y, cv=cv_strategy, scoring='accuracy', n_jobs=-1)
+print(f"\\n 5-Fold Cross Validation Scores: {[round(s*100, 2) for s in cv_scores]}")
+print(f" Rata-rata CV Accuracy: {cv_scores.mean()*100:.2f}% (+/- {cv_scores.std()*100:.2f}%)")
 
 # Simpan model
 joblib.dump(rf_pipeline, "rf_apd_model.pkl")
-print("   Model disimpan ke: rf_apd_model.pkl")
+print("\\n Model disimpan ke: rf_apd_model.pkl")
 
-# --- GRAFIK: Learning Curve (Akurasi vs Jumlah Data) ---
-cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+# --- GRAFIK 1: Feature Importance ---
+importances = rf_pipeline.named_steps['rf'].feature_importances_
+indices = np.argsort(importances)[::-1]
+
+plt.figure(figsize=(10, 5))
+plt.title("Feature Importance (Tingkat Kepentingan Fitur)", fontsize=14, fontweight='bold')
+plt.bar(range(X.shape[1]), importances[indices], align="center", color="#FF9800", edgecolor='black')
+plt.xticks(range(X.shape[1]), [feature_names[i] for i in indices], rotation=15, fontsize=12)
+plt.ylabel("Skor Kepentingan", fontsize=12)
+plt.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# --- GRAFIK 2: Learning Curve ---
 train_sizes, train_scores, val_scores = learning_curve(
     rf_pipeline, X, y,
     train_sizes=np.linspace(0.3, 1.0, 8),
@@ -263,7 +297,7 @@ plt.grid(True, alpha=0.3)
 plt.ylim([40, 105])
 plt.tight_layout()
 plt.show()
-print(" Grafik di atas menunjukkan proses belajar model: semakin banyak data, semakin stabil akurasinya.")
+print(" Grafik Learning Curve stabil, dan Feature Importance menunjukkan fitur yang paling dominan.")
 """
 
 text_boundary = """\
